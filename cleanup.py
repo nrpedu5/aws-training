@@ -151,6 +151,14 @@ def teardown_vpc_networking(region: str, vpc_id: str, dry_run: bool):
         )["Subnets"]:
             ec2.delete_subnet(SubnetId=subnet["SubnetId"])
 
+        # Custom NACLs must be deleted after their subnet (above) is gone --
+        # delete_network_acl fails while it still has an active association.
+        for nacl in ec2.describe_network_acls(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        )["NetworkAcls"]:
+            if not nacl["IsDefault"]:
+                ec2.delete_network_acl(NetworkAclId=nacl["NetworkAclId"])
+
     step(f"Tear down networking in VPC {vpc_id} ({region})", dry_run, _do)
 
 

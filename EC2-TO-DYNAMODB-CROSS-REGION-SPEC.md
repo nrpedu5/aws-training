@@ -12,10 +12,12 @@ used to validate the traffic at the network layer.
 flowchart TB
     subgraph EastRegion["us-east-1 — East Region"]
         subgraph EastVPC["East VPC — vpc-0df27265fd3dca4ac (10.99.0.0/16)"]
-            subgraph EastSubnet["Public subnet — 10.99.1.0/24"]
+            subgraph EastSubnet["Public subnet — 10.99.1.0/24<br/>NACL: acl-0f0ccd01ca68b93f3"]
                 EC2["EC2 t3.micro — i-0aa25e791634f1c78<br/>IAM role: aws-trainer-ec2-dynamodb-role<br/>(scoped to 1 table, + SSM core)"]
+                SG["Security group sg-0a4034b14c9af505e<br/>(stateful)<br/>out: 443/tcp, 123/udp only<br/>no inbound rules needed"]
+                EC2 --- SG
             end
-            SG["Security group<br/>no inbound rules"]
+            NACL["Network ACL acl-0f0ccd01ca68b93f3<br/>(stateless, subnet boundary)<br/>out: 443/tcp, 123/udp<br/>in: ephemeral 1024-65535<br/>(return-path rule — NACLs don't auto-allow responses)"]
             RT["Route table<br/>0.0.0.0/0 → IGW"]
             IGW["Internet Gateway<br/>igw-07f5532c2243f0230"]
             FlowLog["VPC Flow Log<br/>fl-0aea8c59e8fa9798d<br/>ALL traffic, 600s interval"]
@@ -32,19 +34,38 @@ flowchart TB
     CWLogs["CloudWatch Log Group<br/>/aws-trainer/vpc-flow-logs"]
     SSM["Systems Manager<br/>(remote command exec — no SSH, no open ports)"]
 
-    EC2 -- "1. HTTPS:443 out via public IP" --> IGW
-    IGW -- "2. public internet" --> DDB
-    DDB -- "3. response" --> IGW
-    IGW -- "4. back to instance" --> EC2
+    EC2 -- "1. leaves ENI, checked by SG (stateful)" --> SG
+    SG -- "2. leaves subnet, checked by NACL (stateless)" --> NACL
+    NACL -- "3. HTTPS:443 out" --> IGW
+    IGW -- "4. public internet" --> DDB
+    DDB -- "5. response" --> IGW
+    IGW -- "6. NACL inbound rule: ephemeral port allowed back in" --> NACL
+    NACL -- "7. SG auto-allows response (stateful)" --> SG
+    SG -- "8. back to instance" --> EC2
     SSM -.->|controls| EC2
     EastSubnet -.->|routed by| RT
-    EastSubnet -.->|protected by| SG
     EastVPC -.->|traffic captured by| FlowLog
     FlowLog -->|delivers to| CWLogs
 
     style DDB fill:#f9a825,stroke:#333
     style EC2 fill:#4fc3f7,stroke:#333
+    style NACL fill:#ce93d8,stroke:#333
+    style SG fill:#a5d6a7,stroke:#333
 ```
+
+**Two layers, deliberately made visible.** The subnet originally used the
+VPC's *default* NACL, which silently allows everything — traffic was
+already "crossing a NACL," just an invisible one doing nothing. A custom
+NACL (`acl-0f0ccd01ca68b93f3`) replaces that default, with only the two
+outbound rules this lab's traffic actually needs (443/tcp, 123/udp) — and,
+critically, matching **inbound** rules for the ephemeral port range, since
+NACLs are **stateless**: allowing a request out does not automatically
+allow its response back in, unlike the security group. The SG's own
+default "allow all outbound" rule was likewise replaced with the same
+scoped 443/123 set, with **no matching inbound rule needed** on the SG
+side — the direct side-by-side contrast is the point: same intent
+(scoped egress), two different enforcement models (stateless per-subnet
+vs. stateful per-ENI).
 
 **Why it looks like this, not simpler:** DynamoDB is a regional managed
 service, not a resource that lives inside a customer VPC — it can't be
@@ -192,6 +213,38 @@ To validate the *network path* itself, not just the API call succeeding:
    inbound rules — a secondary confirmation the security group works as
    intended.
 
+## Step 6 — Explicit NACL + SG layers (network-layer defense in depth)
+
+`aws_ws/examples/07_nacl_sg_layers.py create --vpc-id vpc-0df27265fd3dca4ac
+--subnet-id subnet-0f3554f60ec4bbe8e --sg-id sg-0a4034b14c9af505e
+--instance-id i-0aa25e791634f1c78` made the east subnet's security
+enforcement explicit instead of relying on defaults:
+
+1. **Custom NACL** `acl-0f0ccd01ca68b93f3` created and associated with the
+   east subnet (replacing the default NACL association). Rules:
+   - Outbound: allow `443/tcp` and `123/udp` to `0.0.0.0/0`
+   - Inbound: allow `1024-65535/tcp` and `1024-65535/udp` from `0.0.0.0/0`
+     — the **return-path rule a stateless NACL requires**. Without this,
+     outbound requests would leave fine but every response would be
+     silently dropped (connections would just hang, not fail loudly).
+2. **Security group** `sg-0a4034b14c9af505e`'s default "allow all
+   outbound" rule was revoked and replaced with the same scoped set
+   (`443/tcp`, `123/udp`) — but **no matching inbound rule was needed**,
+   since security groups are **stateful**: a response to traffic the SG
+   already allowed out is automatically permitted back in.
+3. Re-ran the DynamoDB connectivity test
+   (`aws dynamodb put-item`/`get-item` via SSM) — **succeeded**, proving
+   the request genuinely passes both layers now (previously-implicit
+   default-NACL allow-all, now an explicit, minimal, auditable rule set
+   at both the subnet boundary and the ENI).
+
+**Stateless vs. stateful, made concrete:** this is the practical
+difference between NACLs and security groups that's easy to state
+abstractly and easy to get wrong in practice — forgetting the NACL's
+inbound ephemeral-port rule is a classic real-world "why can requests go
+out but responses never come back" bug. Reproducing it here (rather than
+just describing it) is the actual teaching value of this step.
+
 ## Full resource inventory (for cleanup / reference)
 
 | Resource | ID | Region |
@@ -208,6 +261,8 @@ To validate the *network path* itself, not just the API call succeeding:
 | IAM role (Flow Logs) | `aws-trainer-vpc-flow-logs-role` | global |
 | VPC Flow Log | `fl-0aea8c59e8fa9798d` | us-east-1 |
 | CloudWatch Log Group | `/aws-trainer/vpc-flow-logs` | us-east-1 |
+| Security group | `sg-0a4034b14c9af505e` | us-east-1 |
+| Custom NACL | `acl-0f0ccd01ca68b93f3` | us-east-1 |
 
 ## Cleanup
 
