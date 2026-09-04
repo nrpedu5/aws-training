@@ -245,6 +245,46 @@ inbound ephemeral-port rule is a classic real-world "why can requests go
 out but responses never come back" bug. Reproducing it here (rather than
 just describing it) is the actual teaching value of this step.
 
+## Step 7 — One-command evidence of the full traversal
+
+`logs/traversal_evidence.sh` (run from your own terminal with admin
+credentials, **not** from inside the EC2 instance — its IAM role is
+deliberately scoped to DynamoDB only and correctly refuses `ec2:*`/`logs:*`
+actions, confirmed live via an `UnauthorizedOperation` error when tried) —
+combines every proof mechanism used throughout this lab into one script:
+
+1. Security Group rules (`describe-security-groups`)
+2. Network ACL rules (`describe-network-acls`)
+3. **VPC Reachability Analyzer** (~$0.10/run, skippable via
+   `--skip-reachability`) — creates a path from the instance's ENI to the
+   Internet Gateway and returns the literal hop-by-hop breakdown,
+   confirmed live:
+   ```
+   Path found: true
+   [1] eni-023d12f322225ea4e
+   [2] aws-trainer-ec2-sg-... (sg-0a4034b14c9af505e) -- SG rule: egress tcp/443 0.0.0.0/0 ALLOW
+   [3] aws-trainer-demo-nacl (acl-0f0ccd01ca68b93f3) -- NACL rule #100: tcp port 443 ALLOW
+   [4] rtb-0b2f585874223dc7f -- route 0.0.0.0/0 -> igw-07f5532c2243f0230 (active)
+   [5] aws-trainer-demo-subnet (igw-07f5532c2243f0230)
+   ```
+   This is the tool that names each layer explicitly — Flow Logs (below)
+   prove real traffic happened, but fold both layers' verdicts into one
+   combined `ACCEPT`/`REJECT`; Reachability Analyzer is what actually says
+   "the security group's rule X allowed it, then the NACL's rule Y allowed
+   it," hop by hop.
+4. VPC Flow Logs, tailed live
+5. Destination IPs cross-checked against AWS's published IP ranges (same
+   method as Step 5) — confirmed live: `35.71.66.107 -> DYNAMODB / us-west-2`
+6. **A genuine limitation, documented rather than glossed over:**
+   `aws cloudtrail lookup-events` for `PutItem`/`GetItem` came back empty
+   on a live run — because those are DynamoDB **data events**, which
+   CloudTrail's default 90-day Event History does **not** capture (only
+   management events are covered without an explicitly configured,
+   separately-billed trail with data-event selectors). The script prints
+   this as an expected result with an explanation, rather than silently
+   showing nothing. The actual API-call-level proof for this lab comes
+   from Step 4's SSM command output instead.
+
 ## Full resource inventory (for cleanup / reference)
 
 | Resource | ID | Region |
