@@ -6,6 +6,57 @@ an IAM role scoped to one DynamoDB table, a DynamoDB table in the west
 region, a proven cross-region connection between them, and VPC Flow Logs
 used to validate the traffic at the network layer.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph EastRegion["us-east-1 — East Region"]
+        subgraph EastVPC["East VPC — vpc-0df27265fd3dca4ac (10.99.0.0/16)"]
+            subgraph EastSubnet["Public subnet — 10.99.1.0/24"]
+                EC2["EC2 t3.micro — i-0aa25e791634f1c78<br/>IAM role: aws-trainer-ec2-dynamodb-role<br/>(scoped to 1 table, + SSM core)"]
+            end
+            SG["Security group<br/>no inbound rules"]
+            RT["Route table<br/>0.0.0.0/0 → IGW"]
+            IGW["Internet Gateway<br/>igw-07f5532c2243f0230"]
+            FlowLog["VPC Flow Log<br/>fl-0aea8c59e8fa9798d<br/>ALL traffic, 600s interval"]
+        end
+    end
+
+    subgraph WestRegion["us-west-2 — West Region"]
+        subgraph WestVPC["West VPC — vpc-0e2bafe7b31c1c5fd (10.99.0.0/16)"]
+            WestSubnet["Placeholder subnet — 10.99.1.0/24<br/>no IGW, unused — exists only<br/>so both VPCs are populated"]
+        end
+        DDB[("DynamoDB table<br/>aws-trainer-demo-table<br/>NOT inside any VPC —<br/>public regional endpoint")]
+    end
+
+    CWLogs["CloudWatch Log Group<br/>/aws-trainer/vpc-flow-logs"]
+    SSM["Systems Manager<br/>(remote command exec — no SSH, no open ports)"]
+
+    EC2 -- "1. HTTPS:443 out via public IP" --> IGW
+    IGW -- "2. public internet" --> DDB
+    DDB -- "3. response" --> IGW
+    IGW -- "4. back to instance" --> EC2
+    SSM -.->|controls| EC2
+    EastSubnet -.->|routed by| RT
+    EastSubnet -.->|protected by| SG
+    EastVPC -.->|traffic captured by| FlowLog
+    FlowLog -->|delivers to| CWLogs
+
+    style DDB fill:#f9a825,stroke:#333
+    style EC2 fill:#4fc3f7,stroke:#333
+```
+
+**Why it looks like this, not simpler:** DynamoDB is a regional managed
+service, not a resource that lives inside a customer VPC — it can't be
+reached via VPC peering the way an EC2/RDS instance in another VPC could.
+Since the table (west) and the VPC (east) are in different regions, the
+same-region-only VPC Gateway Endpoint option is off the table, leaving the
+public-endpoint-over-the-internet path as the only real option — hence the
+Internet Gateway (chosen over a NAT Gateway specifically to avoid its
+~$0.045/hr recurring cost) and the security group with zero inbound rules
+(nothing needs to reach *in* to the instance — SSM handles remote access
+outbound-only).
+
 ## Account setup
 
 1. **AWS CLI** installed locally (`brew install awscli`).
