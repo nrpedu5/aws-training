@@ -14,35 +14,50 @@ IAM permission would cause **Access Denied**, not a timeout.
 This isn't just asserted — every state below was actually built and tested
 via `aws_ws/examples/08_s3_gateway_endpoint_timeout_scenario.py`.
 
-## Architecture (working baseline)
+## The three scenarios, grouped by phase with the specific action at each hop
 
 ```mermaid
-flowchart TB
-    subgraph VPC["VPC vpc-053908c4460150d9f — aws-trainer-demo-vpc (10.99.0.0/16), us-east-1"]
-        subgraph Subnet["Public subnet subnet-095efb30769cd25f7 (10.99.1.0/24)"]
-            EC2["EC2 t3.micro — i-042da759ae55e1302<br/>IAM role: aws-trainer-s3-endpoint-ec2-role<br/>(S3 GetObject/ListBucket on 1 bucket, + SSM core)"]
-            SG["Security Group sg-07fbe63cde49763e9<br/>(stateful) — outbound 443 ALLOW"]
-            EC2 --- SG
-        end
-        NACL["Network ACL — outbound 443 ALLOW<br/>+ inbound ephemeral 1024-65535 ALLOW<br/>(the return-path rule)"]
-        RT["MAIN Route Table rtb-009825f76a0d50710<br/>0.0.0.0/0 → IGW (internet)<br/>pl-xxx (S3 prefix list) → vpce-0bd665227fffbfead (Gateway Endpoint)"]
-        IGW["Internet Gateway"]
-        VPCE["Gateway VPC Endpoint for S3<br/>vpce-0bd665227fffbfead<br/>(no hourly/GB charge, private route only)"]
+sequenceDiagram
+    participant EC2 as EC2 Instance
+    participant SG as Security Group
+    participant NACL as Network ACL
+    participant RT as Route Table + Gateway Endpoint
+    participant S3 as S3 Bucket
+
+    rect rgb(222, 245, 222)
+    Note over EC2,S3: BASELINE — SG allows 443 out · NACL allows 443 out + ephemeral in
+    EC2->>SG: Outbound :443
+    SG->>NACL: egress rule #100 (443) → ALLOW, forwarded
+    NACL->>RT: egress rule #100 (443) → ALLOW, forwarded
+    RT->>S3: S3 IP matches prefix list → routed via Gateway Endpoint (not the IGW)
+    S3-->>RT: response
+    RT-->>NACL: response arrives at subnet boundary
+    NACL-->>SG: ingress rule #100 (ephemeral 1024-65535) → ALLOW, forwarded
+    SG-->>EC2: stateful — response auto-allowed back → SUCCESS (0.017s)
     end
 
-    S3[("S3 bucket<br/>aws-trainer-s3-endpoint-demo-...<br/>same region (us-east-1)")]
+    rect rgb(250, 214, 214)
+    Note over EC2,S3: EXPERIMENT A — all Security Group outbound rules revoked
+    EC2->>SG: Outbound :443
+    SG--xEC2: egress rule check: NO RULES MATCH → dropped at the ENI → TIMEOUT
+    end
 
-    EC2 -- "1. leaves ENI, SG checked (stateful)" --> SG
-    SG -- "2. leaves subnet, NACL checked (stateless)" --> NACL
-    NACL -- "3. route lookup: S3 IP matches prefix list" --> RT
-    RT -- "4. routed via Gateway Endpoint, NOT the IGW" --> VPCE
-    VPCE -- "5. private AWS network path" --> S3
-    S3 -- "6. response" --> VPCE --> RT --> NACL -- "7. ephemeral port allowed back in" --> SG --> EC2
+    rect rgb(250, 214, 214)
+    Note over EC2,S3: EXPERIMENT B — NACL allows 443 out, but the inbound ephemeral rule was never added
+    EC2->>SG: Outbound :443 (SG fine → forwarded)
+    SG->>NACL: egress rule #100 (443) → ALLOW, forwarded
+    NACL->>RT: egress rule #100 (443) → ALLOW, forwarded
+    RT->>S3: routed via Gateway Endpoint — request DOES reach S3
+    S3-->>RT: response sent back
+    RT-->>NACL: response arrives at subnet boundary
+    NACL--xEC2: ingress rule check: NO EPHEMERAL RULE → response silently DROPPED (stateless) → TIMEOUT
+    Note over NACL,EC2: Same missing rule also breaks SSM's own control channel for the ENTIRE subnet — not just S3 traffic
+    end
 
-    style S3 fill:#f9a825,stroke:#333
-    style EC2 fill:#4fc3f7,stroke:#333
-    style VPCE fill:#ce93d8,stroke:#333
+    Note over EC2,S3: Fixing EITHER A or B alone (independently confirmed) restores the exact Baseline path above
 ```
+
+**What this shows that a topology diagram can't:** the request in Experiment B genuinely **reaches S3 and gets a response** — the failure isn't "can't connect," it's "the response can't get back in." That's the concrete, mechanical reason a stateless NACL misconfiguration produces a timeout that looks identical from the EC2 instance's side to Experiment A's failure, even though the two are broken in opposite directions (A blocks the request from ever leaving; B blocks the response from ever arriving).
 
 **Key point the question is testing:** the Gateway Endpoint only changes
 *which route* S3-bound traffic takes (step 4 — via the endpoint instead of
